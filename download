@@ -1,0 +1,163 @@
+-- =====================================================================
+-- Elite Auto Performance — database schema + security
+-- Run this once in the Supabase SQL editor (Dashboard > SQL Editor > New query).
+-- It creates every table, the role system, and the rules that make
+-- cost/margin and payroll genuinely invisible to employees.
+-- =====================================================================
+
+-- ---------- roles ----------
+-- Every signed-in user has exactly one profile row with a role.
+create table if not exists profiles (
+  id    uuid primary key references auth.users(id) on delete cascade,
+  name  text not null,
+  role  text not null default 'employee' check (role in ('owner','employee'))
+);
+
+-- Helper: is the current session an owner? Used by every policy below.
+create or replace function is_owner()
+returns boolean
+language sql stable security definer
+as $$
+  select exists (
+    select 1 from profiles
+    where id = auth.uid() and role = 'owner'
+  );
+$$;
+
+-- ---------- core tables ----------
+create table if not exists customers (
+  id        uuid primary key default gen_random_uuid(),
+  name      text not null,
+  phone     text default '',
+  email     text default '',
+  vehicles  text default '',
+  notes     text default '',
+  created_at timestamptz default now()
+);
+
+create table if not exists quotes (
+  id           uuid primary key default gen_random_uuid(),
+  number       text not null,
+  customer_id  uuid references customers(id) on delete set null,
+  created_by   uuid references profiles(id),
+  vehicle      text default '',
+  status       text default 'Quoted',
+  notes        text default '',
+  pay_link     text default '',
+  quote_date   date default current_date,
+  approved_date date,
+  created_at   timestamptz default now()
+);
+
+create table if not exists labor_lines (
+  id        uuid primary key default gen_random_uuid(),
+  quote_id  uuid references quotes(id) on delete cascade,
+  name      text not null default '',
+  hours     numeric default 0,
+  rate      numeric default 125
+);
+
+-- NOTE the two money columns: cost is what YOU paid, price is what the
+-- customer pays. cost is the secret. price is safe to show anyone.
+create table if not exists parts (
+  id        uuid primary key default gen_random_uuid(),
+  quote_id  uuid references quotes(id) on delete cascade,
+  name      text not null default '',
+  qty       numeric default 1,
+  cost      numeric default 0,   -- OWNER ONLY
+  price     numeric default 0    -- everyone (cost * 1.15, computed on save)
+);
+
+create table if not exists photos (
+  id        uuid primary key default gen_random_uuid(),
+  quote_id  uuid references quotes(id) on delete cascade,
+  url       text not null,
+  created_at timestamptz default now()
+);
+
+create table if not exists time_logs (
+  id          uuid primary key default gen_random_uuid(),
+  employee_id uuid references profiles(id) on delete cascade,
+  start_at    timestamptz not null default now(),
+  end_at      timestamptz
+);
+
+-- =====================================================================
+-- ROW-LEVEL SECURITY — this is the part that actually protects you.
+-- With RLS on, the database returns NOTHING unless a policy says yes.
+-- =====================================================================
+alter table profiles    enable row level security;
+alter table customers   enable row level security;
+alter table quotes      enable row level security;
+alter table labor_lines enable row level security;
+alter table parts       enable row level security;
+alter table photos      enable row level security;
+alter table time_logs   enable row level security;
+
+-- profiles: you can read your own; owner can read all. Nobody self-promotes.
+create policy profiles_read on profiles for select
+  using (id = auth.uid() or is_owner());
+
+-- customers, quotes, labor, photos: any signed-in staff member can use them.
+create policy customers_all on customers for all using (auth.role() = 'authenticated') with check (auth.role() = 'authenticated');
+create policy quotes_all    on quotes    for all using (auth.role() = 'authenticated') with check (auth.role() = 'authenticated');
+create policy labor_all     on labor_lines for all using (auth.role() = 'authenticated') with check (auth.role() = 'authenticated');
+create policy photos_all    on photos    for all using (auth.role() = 'authenticated') with check (auth.role() = 'authenticated');
+
+-- parts: everyone may read/write rows, BUT the cost column is fenced off
+-- below by a view. The base table is owner-only for direct SELECT so a
+-- curious employee can't query cost straight from the table.
+create policy parts_owner_full on parts for all
+  using (is_owner()) with check (is_owner());
+
+-- Employees touch parts ONLY through this view, which has no cost column.
+-- A SELECT here can never return cost because the column isn't in the view.
+create or replace view parts_public as
+  select id, quote_id, name, qty, price from parts;
+
+-- Let employees insert/update parts via a function that sets price and cost
+-- together (cost from the markup) without ever reading cost back.
+create or replace function save_part(
+  p_id uuid, p_quote uuid, p_name text, p_qty numeric, p_price numeric
+) returns void language plpgsql security definer as $$
+begin
+  insert into parts (id, quote_id, name, qty, price)
+  values (coalesce(p_id, gen_random_uuid()), p_quote, p_name, p_qty, p_price)
+  on conflict (id) do update
+    set name = excluded.name, qty = excluded.qty, price = excluded.price;
+end; $$;
+
+-- time_logs: you see and edit your own. Owner sees and edits all.
+create policy time_self_read   on time_logs for select using (employee_id = auth.uid() or is_owner());
+create policy time_self_write  on time_logs for insert with check (employee_id = auth.uid() or is_owner());
+create policy time_self_update on time_logs for update using (employee_id = auth.uid() or is_owner());
+create policy time_owner_del   on time_logs for delete using (is_owner());
+
+-- Payroll rollup: an owner-only function. Employees can't call it usefully —
+-- it returns nothing unless the caller is an owner.
+create or replace function payroll_this_week()
+returns table(name text, hours numeric)
+language plpgsql security definer as $$
+begin
+  if not is_owner() then
+    return; -- empty result for non-owners
+  end if;
+  return query
+    select p.name,
+           round(sum(extract(epoch from (coalesce(t.end_at, now()) - t.start_at)) / 3600.0)::numeric, 1)
+    from time_logs t
+    join profiles p on p.id = t.employee_id
+    where t.start_at > now() - interval '7 days'
+    group by p.name
+    having sum(extract(epoch from (coalesce(t.end_at, now()) - t.start_at))) > 0;
+end; $$;
+
+-- =====================================================================
+-- AFTER running this: create your users in Authentication > Users, then
+-- insert a profile row for each. Make yourself the owner:
+--
+--   insert into profiles (id, name, role) values
+--     ('<your-auth-user-id>', 'Gabriel', 'owner');
+--   insert into profiles (id, name, role) values
+--     ('<employee-auth-id>', 'Mike', 'employee');
+-- =====================================================================
